@@ -1,3 +1,3 @@
-module github.com/afaerber/go-descrypt
+module github.com/andreasfaerber/go-descrypt
 
 go 1.24
