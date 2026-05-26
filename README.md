@@ -11,7 +11,7 @@ Pure Go implementation of the traditional DES-based Unix crypt(3) password hashi
 ## Installation
 
 ```bash
-go get github.com/afaerber/go-descrypt
+go get github.com/andreasfaerber/go-descrypt
 ```
 
 ## Usage
@@ -21,7 +21,7 @@ package main
 
 import (
     "fmt"
-    "github.com/afaerber/go-descrypt"
+    "github.com/andreasfaerber/go-descrypt"
 )
 
 func main() {
