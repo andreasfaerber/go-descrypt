@@ -1,12 +1,11 @@
 # go-descrypt
 
-Pure Go implementation of the traditional DES-based Unix crypt(3) password hashing algorithm.
+Pure Go implementation of the traditional DES-based Unix crypt(3) password hashing algorithm. Based on https://github.com/dworkin/dgd.git crypt implementation.
 
 ## Features
 
 - **Pure Go** - No CGO, no system crypt library dependencies
 - **Compatible** - Produces hashes compatible with traditional crypt(3)
-- **Simple API** - Encrypt, verify, and generate salts with ease
 
 ## Installation
 
