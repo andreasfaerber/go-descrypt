@@ -1,207 +1,509 @@
 // Package descrypt implements the traditional DES-based Unix crypt(3) password hashing.
-//
-// This is a pure Go implementation that does not rely on the system's crypt library.
-// The algorithm uses a 56-bit DES key derived from the password and encrypts
-// a zero block with salt modifications applied during 25 rounds.
 package descrypt
 
 import (
-	"crypto/cipher"
-	"crypto/des"
 	"crypto/rand"
 	"fmt"
 )
 
-// The base64 alphabet used by crypt(3) - different from standard base64
 const ito64 = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-
-// Salt length for traditional crypt
 const SaltLen = 2
-
-// HashLen is the length of a traditional DES crypt hash
 const HashLen = 13
 
-// Encrypt generates a DES-based crypt hash of the password with the given salt.
-// The salt must be exactly 2 characters from the crypt(3) base64 alphabet.
-// Returns a 13-character hash in the format: SS + 11-char-hash
-//
-// Example:
-//
-//	hash, err := descrypt.Encrypt("hello", "Hi")
-//	// Returns: "HiT9fJN1A8c.2"
+// Salt table from the reference implementation
+var saltTable = [256]byte{
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32,
+	16, 48, 8, 40, 24, 56, 4, 36, 20, 52, 40, 24, 56, 4, 36, 20,
+	52, 12, 44, 28, 60, 2, 34, 18, 50, 10, 42, 26, 58, 6, 38, 22,
+	54, 14, 46, 30, 62, 1, 33, 17, 49, 9, 41, 1, 33, 17, 49, 9,
+	41, 25, 57, 5, 37, 21, 53, 13, 45, 29, 61, 3, 35, 19, 51, 11,
+	43, 27, 59, 7, 39, 23, 55, 15, 47, 31, 63, 0, 0, 0, 0, 0,
+}
+
+// Rotation schedule for key generation
+// C Rot[] = {0,1,1,1,1,1,1,0,1,1,1,1,1,1,0,0}, iterates i=15..0
+// Sequence: Rot[15],Rot[14],...,Rot[0] = 0,0,1,1,1,1,1,1,0,1,1,1,1,1,1,0
+// We iterate i=0..15, so rot[] must equal that sequence
+var rot = [16]byte{0, 0, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 0}
+
+// PC2 lookup tables (14 tables of 16 entries each)
+var pc2 = [14][16]uint32{
+	{
+		0x00000000, 0x00040000, 0x00002000, 0x00042000,
+		0x00000001, 0x00040001, 0x00002001, 0x00042001,
+		0x02000000, 0x02040000, 0x02002000, 0x02042000,
+		0x02000001, 0x02040001, 0x02002001, 0x02042001,
+	},
+	{
+		0x00000000, 0x00010000, 0x00000010, 0x00010010,
+		0x00000400, 0x00010400, 0x00000410, 0x00010410,
+		0x01000000, 0x01010000, 0x01000010, 0x01010010,
+		0x01000400, 0x01010400, 0x01000410, 0x01010410,
+	},
+	{
+		0x00000000, 0x00080000, 0x08000000, 0x08080000,
+		0x00000100, 0x00080100, 0x08000100, 0x08080100,
+		0x00000000, 0x00080000, 0x08000000, 0x08080000,
+		0x00000100, 0x00080100, 0x08000100, 0x08080100,
+	},
+	{
+		0x00000000, 0x00000020, 0x00000800, 0x00000820,
+		0x20000000, 0x20000020, 0x20000800, 0x20000820,
+		0x00000002, 0x00000022, 0x00000802, 0x00000822,
+		0x20000002, 0x20000022, 0x20000802, 0x20000822,
+	},
+	{
+		0x00000000, 0x00000004, 0x00100000, 0x00100004,
+		0x00000000, 0x00000004, 0x00100000, 0x00100004,
+		0x10000000, 0x10000004, 0x10100000, 0x10100004,
+		0x10000000, 0x10000004, 0x10100000, 0x10100004,
+	},
+	{
+		0x00000000, 0x04000000, 0x00200000, 0x04200000,
+		0x00000000, 0x04000000, 0x00200000, 0x04200000,
+		0x00000200, 0x04000200, 0x00200200, 0x04200200,
+		0x00000200, 0x04000200, 0x00200200, 0x04200200,
+	},
+	{
+		0x00000000, 0x00001000, 0x00000008, 0x00001008,
+		0x00020000, 0x00021000, 0x00020008, 0x00021008,
+		0x00000000, 0x00001000, 0x00000008, 0x00001008,
+		0x00020000, 0x00021000, 0x00020008, 0x00021008,
+	},
+	{
+		0x00000000, 0x00000001, 0x08000000, 0x08000001,
+		0x00002000, 0x00002001, 0x08002000, 0x08002001,
+		0x00000002, 0x00000003, 0x08000002, 0x08000003,
+		0x00002002, 0x00002003, 0x08002002, 0x08002003,
+	},
+	{
+		0x00000000, 0x00000004, 0x00000000, 0x00000004,
+		0x00020000, 0x00020004, 0x00020000, 0x00020004,
+		0x00000200, 0x00000204, 0x00000200, 0x00000204,
+		0x00020200, 0x00020204, 0x00020200, 0x00020204,
+	},
+	{
+		0x00000000, 0x00001000, 0x00080000, 0x00081000,
+		0x00000000, 0x00001000, 0x00080000, 0x00081000,
+		0x04000000, 0x04001000, 0x04080000, 0x04081000,
+		0x04000000, 0x04001000, 0x04080000, 0x04081000,
+	},
+	{
+		0x00000000, 0x00200000, 0x00000000, 0x00200000,
+		0x00000010, 0x00200010, 0x00000010, 0x00200010,
+		0x20000000, 0x20200000, 0x20000000, 0x20200000,
+		0x20000010, 0x20200010, 0x20000010, 0x20200010,
+	},
+	{
+		0x00000000, 0x00000100, 0x02000000, 0x02000100,
+		0x00000020, 0x00000120, 0x02000020, 0x02000120,
+		0x00000400, 0x00000500, 0x02000400, 0x02000500,
+		0x00000420, 0x00000520, 0x02000420, 0x02000520,
+	},
+	{
+		0x00000000, 0x10000000, 0x00000800, 0x10000800,
+		0x00000008, 0x10000008, 0x00000808, 0x10000808,
+		0x00100000, 0x10100000, 0x00100800, 0x10100800,
+		0x00100008, 0x10100008, 0x00100808, 0x10100808,
+	},
+	{
+		0x00000000, 0x00040000, 0x01000000, 0x01040000,
+		0x00000000, 0x00040000, 0x01000000, 0x01040000,
+		0x00010000, 0x00050000, 0x01010000, 0x01050000,
+		0x00010000, 0x00050000, 0x01010000, 0x01050000,
+	},
+}
+
+// SP boxes (combined S-box and P permutation)
+var sp = [8][64]uint32{
+	{
+		0x00101040, 0x00000000, 0x00001000, 0x40101040,
+		0x40101000, 0x40001040, 0x40000000, 0x00001000,
+		0x00000040, 0x00101040, 0x40101040, 0x00000040,
+		0x40100040, 0x40101000, 0x00100000, 0x40000000,
+		0x40000040, 0x00100040, 0x00100040, 0x00001040,
+		0x00001040, 0x00101000, 0x00101000, 0x40100040,
+		0x40001000, 0x40100000, 0x40100000, 0x40001000,
+		0x00000000, 0x40000040, 0x40001040, 0x00100000,
+		0x00001000, 0x40101040, 0x40000000, 0x00101000,
+		0x00101040, 0x00100000, 0x00100000, 0x00000040,
+		0x40101000, 0x00001000, 0x00001040, 0x40100000,
+		0x00000040, 0x40000000, 0x40100040, 0x40001040,
+		0x40101040, 0x40001000, 0x00101000, 0x40100040,
+		0x40100000, 0x40000040, 0x40001040, 0x00101040,
+		0x40000040, 0x00100040, 0x00100040, 0x00000000,
+		0x40001000, 0x00001040, 0x00000000, 0x40101000,
+	},
+	{
+		0x08010802, 0x08000800, 0x00000800, 0x00010802,
+		0x00010000, 0x00000002, 0x08010002, 0x08000802,
+		0x08000002, 0x08010802, 0x08010800, 0x08000000,
+		0x08000800, 0x00010000, 0x00000002, 0x08010002,
+		0x00010800, 0x00010002, 0x08000802, 0x00000000,
+		0x08000000, 0x00000800, 0x00010802, 0x08010000,
+		0x00010002, 0x08000002, 0x00000000, 0x00010800,
+		0x00000802, 0x08010800, 0x08010000, 0x00000802,
+		0x00000000, 0x00010802, 0x08010002, 0x00010000,
+		0x08000802, 0x08010000, 0x08010800, 0x00000800,
+		0x08010000, 0x08000800, 0x00000002, 0x08010802,
+		0x00010802, 0x00000002, 0x00000800, 0x08000000,
+		0x00000802, 0x08010800, 0x00010000, 0x08000002,
+		0x00010002, 0x08000802, 0x08000002, 0x00010002,
+		0x00010800, 0x00000000, 0x08000800, 0x00000802,
+		0x08000000, 0x08010002, 0x08010802, 0x00010800,
+	},
+	{
+		0x80000020, 0x00802020, 0x00000000, 0x80802000,
+		0x00800020, 0x00000000, 0x80002020, 0x00800020,
+		0x80002000, 0x80800000, 0x80800000, 0x00002000,
+		0x80802020, 0x80002000, 0x00802000, 0x80000020,
+		0x00800000, 0x80000000, 0x00802020, 0x00000020,
+		0x00002020, 0x00802000, 0x80802000, 0x80002020,
+		0x80800020, 0x00002020, 0x00002000, 0x80800020,
+		0x80000000, 0x80802020, 0x00000020, 0x00800000,
+		0x00802020, 0x00800000, 0x80002000, 0x80000020,
+		0x00002000, 0x00802020, 0x00800020, 0x00000000,
+		0x00000020, 0x80002000, 0x80802020, 0x00800020,
+		0x80800000, 0x00000020, 0x00000000, 0x80802000,
+		0x80800020, 0x00002000, 0x00800000, 0x80802020,
+		0x80000000, 0x80002020, 0x00002020, 0x80800000,
+		0x00802000, 0x80800020, 0x80000020, 0x00802000,
+		0x80002020, 0x80000000, 0x80802000, 0x00002020,
+	},
+	{
+		0x10080200, 0x10000208, 0x10000208, 0x00000008,
+		0x00080208, 0x10080008, 0x10080000, 0x10000200,
+		0x00000000, 0x00080200, 0x00080200, 0x10080208,
+		0x10000008, 0x00000000, 0x00080008, 0x10080000,
+		0x10000000, 0x00000200, 0x00080000, 0x10080200,
+		0x00000008, 0x00080000, 0x10000200, 0x00000208,
+		0x10080008, 0x10000000, 0x00000208, 0x00080008,
+		0x00000200, 0x00080208, 0x10080208, 0x10000008,
+		0x00080008, 0x10080000, 0x00080200, 0x10080208,
+		0x10000008, 0x00000000, 0x00000000, 0x00080200,
+		0x00000208, 0x00080008, 0x10080008, 0x10000000,
+		0x10080200, 0x10000208, 0x10000208, 0x00000008,
+		0x10080208, 0x10000008, 0x10000000, 0x00000200,
+		0x10080000, 0x10000200, 0x00080208, 0x10080008,
+		0x10000200, 0x00000208, 0x00080000, 0x10080200,
+		0x00000008, 0x00080000, 0x00000200, 0x00080208,
+	},
+	{
+		0x00000010, 0x00208010, 0x00208000, 0x04200010,
+		0x00008000, 0x00000010, 0x04000000, 0x00208000,
+		0x04008010, 0x00008000, 0x00200010, 0x04008010,
+		0x04200010, 0x04208000, 0x00008010, 0x04000000,
+		0x00200000, 0x04008000, 0x04008000, 0x00000000,
+		0x04000010, 0x04208010, 0x04208010, 0x00200010,
+		0x04208000, 0x04000010, 0x00000000, 0x04200000,
+		0x00208010, 0x00200000, 0x04200000, 0x00008010,
+		0x00008000, 0x04200010, 0x00000010, 0x00200000,
+		0x04000000, 0x00208000, 0x04200010, 0x04008010,
+		0x00200010, 0x04000000, 0x04208000, 0x00208010,
+		0x04008010, 0x00000010, 0x00200000, 0x04208000,
+		0x04208010, 0x00008010, 0x04200000, 0x04208010,
+		0x00208000, 0x00000000, 0x04008000, 0x04200000,
+		0x00008010, 0x00200010, 0x04000010, 0x00008000,
+		0x00000000, 0x04008000, 0x00208010, 0x04000010,
+	},
+	{
+		0x02000001, 0x02040000, 0x00000400, 0x02040401,
+		0x02040000, 0x00000001, 0x02040401, 0x00040000,
+		0x02000400, 0x00040401, 0x00040000, 0x02000001,
+		0x00040001, 0x02000400, 0x02000000, 0x00000401,
+		0x00000000, 0x00040001, 0x02000401, 0x00000400,
+		0x00040400, 0x02000401, 0x00000001, 0x02040001,
+		0x02040001, 0x00000000, 0x00040401, 0x02040400,
+		0x00000401, 0x00040400, 0x02040400, 0x02000000,
+		0x02000400, 0x00000001, 0x02040001, 0x00040400,
+		0x02040401, 0x00040000, 0x00000401, 0x02000001,
+		0x00040000, 0x02000400, 0x02000000, 0x00000401,
+		0x02000001, 0x02040401, 0x00040400, 0x02040000,
+		0x00040401, 0x02040400, 0x00000000, 0x02040001,
+		0x00000001, 0x00000400, 0x02040000, 0x00040401,
+		0x00000400, 0x00040001, 0x02000401, 0x00000000,
+		0x02040400, 0x02000000, 0x00040001, 0x02000401,
+	},
+	{
+		0x00020000, 0x20420000, 0x20400080, 0x00000000,
+		0x00000080, 0x20400080, 0x20020080, 0x00420080,
+		0x20420080, 0x00020000, 0x00000000, 0x20400000,
+		0x20000000, 0x00400000, 0x20420000, 0x20000080,
+		0x00400080, 0x20020080, 0x20020000, 0x00400080,
+		0x20400000, 0x00420000, 0x00420080, 0x20020000,
+		0x00420000, 0x00000080, 0x20000080, 0x20420080,
+		0x00020080, 0x20000000, 0x00400000, 0x00020080,
+		0x00400000, 0x00020080, 0x00020000, 0x20400080,
+		0x20400080, 0x20420000, 0x20420000, 0x20000000,
+		0x20020000, 0x00400000, 0x00400080, 0x00020000,
+		0x00420080, 0x20000080, 0x20020080, 0x00420080,
+		0x20000080, 0x20400000, 0x20420080, 0x00420000,
+		0x00020080, 0x00000000, 0x20000000, 0x20420080,
+		0x00000000, 0x20020080, 0x00420000, 0x00000080,
+		0x20400000, 0x00400080, 0x00000080, 0x20020000,
+	},
+	{
+		0x01000104, 0x00000100, 0x00004000, 0x01004104,
+		0x01000000, 0x01000104, 0x00000004, 0x01000000,
+		0x00004004, 0x01004000, 0x01004104, 0x00004100,
+		0x01004100, 0x00004104, 0x00000100, 0x00000004,
+		0x01004000, 0x01000004, 0x01000100, 0x00000104,
+		0x00004100, 0x00004004, 0x01004004, 0x01004100,
+		0x00000104, 0x00000000, 0x00000000, 0x01004004,
+		0x01000004, 0x01000100, 0x00004104, 0x00004000,
+		0x00004104, 0x00004000, 0x01004100, 0x00000100,
+		0x00000004, 0x01004004, 0x00000100, 0x00004104,
+		0x01000100, 0x00000004, 0x01000004, 0x01004000,
+		0x01004004, 0x01000000, 0x00004000, 0x01000104,
+		0x00000000, 0x01004104, 0x00004004, 0x01000004,
+		0x01004000, 0x01000100, 0x01000104, 0x00000000,
+		0x01004104, 0x00004100, 0x00004100, 0x00000104,
+		0x00000104, 0x00004004, 0x01000000, 0x01004100,
+	},
+}
+
+// Output encoding table
+var out = [64]byte{
+	'.', '/', '0', '1', '2', '3', '4', '5',
+	'6', '7', '8', '9', 'A', 'B', 'C', 'D',
+	'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L',
+	'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T',
+	'U', 'V', 'W', 'X', 'Y', 'Z', 'a', 'b',
+	'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j',
+	'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r',
+	's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+}
+
 func Encrypt(password, salt string) (string, error) {
 	if len(salt) < SaltLen {
 		return "", fmt.Errorf("salt must be at least %d characters", SaltLen)
 	}
-
-	// Validate salt characters
 	for i := 0; i < SaltLen; i++ {
 		if !isValidIto64(salt[i]) {
 			return "", fmt.Errorf("invalid salt character at position %d", i)
 		}
 	}
 
-	// Convert password to 56-bit DES key
-	key := passwordToKey(password)
-
-	// Convert salt to modification value
-	saltBits := saltToBits(salt[:SaltLen])
-
-	// Initialize with zeros
-	block := make([]byte, des.BlockSize)
-
-	// Process 25 times with salt modifications
-	for i := 0; i < 25; i++ {
-		// Create DES cipher with salt-modified key schedule
-		c := newDESCipher(key, saltBits)
-
-		// Encrypt current block
-		c.Encrypt(block, block)
-
-		// Swap bytes for next iteration (except last)
-		if i < 24 {
-			for j := 0; j < len(block); j += 2 {
-				if j+1 < len(block) {
-					block[j], block[j+1] = block[j+1], block[j]
-				}
-			}
-		}
+	// Prepare key from password (up to 8 characters)
+	var keyBuf [8]byte
+	for i := 0; i < len(password) && i < 8; i++ {
+		keyBuf[i] = byte(password[i]) & 0x7f
 	}
 
-	// Convert to crypt base64 and take first 11 chars
-	hash := toIto64(block)
+	// Generate subkeys
+	var keys [32]uint32
+	pSetkey(keys[:], keyBuf[:])
 
-	return salt[:SaltLen] + hash[:11], nil
+	// Prepare salt values
+	E := [2]uint32{
+		uint32(saltTable[salt[0]]) << 8,
+		uint32(saltTable[salt[1]]) << 4,
+	}
+
+	// Encrypt zero block
+	var L, R uint32
+	for i := 25; i > 0; i-- {
+		key := 0
+		for j := 7; j >= 0; j-- {
+			T := R ^ (R >> 16)
+			X := T & E[0]
+			X ^= (X << 16) ^ R ^ keys[key]
+			key++
+			L ^= sp[6][X&0x3f]
+			X >>= 8
+			L ^= sp[4][X&0x3f]
+			X >>= 8
+			L ^= sp[2][X&0x3f]
+			X >>= 8
+			L ^= sp[0][X&0x3f]
+
+			X = T & E[1]
+			X ^= (X << 16) ^ R
+			X = ((X << 4) | (X >> 28)) ^ keys[key]
+			key++
+			L ^= sp[7][X&0x3f]
+			X >>= 8
+			L ^= sp[5][X&0x3f]
+			X >>= 8
+			L ^= sp[3][X&0x3f]
+			X >>= 8
+			L ^= sp[1][X&0x3f]
+
+			T = L ^ (L >> 16)
+			X = T & E[0]
+			X ^= (X << 16) ^ L ^ keys[key]
+			key++
+			R ^= sp[6][X&0x3f]
+			X >>= 8
+			R ^= sp[4][X&0x3f]
+			X >>= 8
+			R ^= sp[2][X&0x3f]
+			X >>= 8
+			R ^= sp[0][X&0x3f]
+
+			X = T & E[1]
+			X ^= (X << 16) ^ L
+			X = ((X << 4) | (X >> 28)) ^ keys[key]
+			key++
+			R ^= sp[7][X&0x3f]
+			X >>= 8
+			R ^= sp[5][X&0x3f]
+			X >>= 8
+			R ^= sp[3][X&0x3f]
+			X >>= 8
+			R ^= sp[1][X&0x3f]
+		}
+		// Swap L and R
+		L, R = R, L
+	}
+
+	// Final rotations
+	L = (L << 3) | (L >> 29)
+	R = (R << 3) | (R >> 29)
+
+	// Final permutation (FP)
+	exg2(&L, &R, 1, 0x55555555)
+	exg2(&R, &L, 8, 0xff00ff)
+	exg2(&R, &L, 2, 0x33333333)
+	exg2(&L, &R, 16, 0xffff)
+	exg2(&L, &R, 4, 0x0f0f0f0f)
+
+	// Encode result
+	var result [14]byte
+	copy(result[:2], salt[:2])
+	p := 13
+	result[p] = 0
+	p--
+	result[p] = out[(R<<2)&0x3f]
+	R >>= 4
+	p--
+	result[p] = out[R&0x3f]
+	R >>= 6
+	p--
+	result[p] = out[R&0x3f]
+	R >>= 6
+	p--
+	result[p] = out[R&0x3f]
+	R >>= 6
+	p--
+	result[p] = out[R&0x3f]
+	R >>= 6
+	p--
+	result[p] = out[((L<<4)|R)&0x3f]
+	L >>= 2
+	p--
+	result[p] = out[L&0x3f]
+	L >>= 6
+	p--
+	result[p] = out[L&0x3f]
+	L >>= 6
+	p--
+	result[p] = out[L&0x3f]
+	L >>= 6
+	p--
+	result[p] = out[L&0x3f]
+	L >>= 6
+	p--
+	result[p] = out[L&0x3f]
+
+	return string(result[:13]), nil
 }
 
-// Verify checks if a password matches a given crypt hash.
-// Returns true if the password is correct, false otherwise.
 func Verify(password, hash string) bool {
 	if len(hash) < HashLen {
 		return false
 	}
-
 	salt := hash[:SaltLen]
 	expected := hash[SaltLen:]
-
 	computed, err := Encrypt(password, salt)
 	if err != nil {
 		return false
 	}
-
 	return computed[SaltLen:] == expected
 }
 
-// passwordToKey converts a password string to a 56-bit DES key.
-// Each character contributes 7 bits, packed into 8 bytes with odd parity.
-func passwordToKey(password string) []byte {
-	key := make([]byte, 8)
+// pSetkey prepares a key for encryption/decryption (PC-1 + PC-2)
+func pSetkey(keys []uint32, k []byte) {
+	var L, R, A, B uint32
 
-	for i := 0; i < len(password) && i < 8; i++ {
-		key[i] = byte(password[i])
-	}
+	// Load key bytes with bit shifting (multiply by 2)
+	L = uint32(k[0]<<1) << 24
+	L |= uint32(k[1]<<1) << 16
+	L |= uint32(k[2]<<1) << 8
+	L |= uint32(k[3] << 1)
+	R = uint32(k[4]<<1) << 24
+	R |= uint32(k[5]<<1) << 16
+	R |= uint32(k[6]<<1) << 8
+	R |= uint32(k[7] << 1)
 
-	// Expand to 8 bytes with proper bit packing
-	packed := make([]byte, 8)
-	for i := 0; i < 8; i++ {
-		if i < len(key) {
-			packed[i] = key[i]
+	// PC-1 permutation using exchange operations
+	exg2(&R, &L, 4, 0x0f0f0f0f)
+	exg1(&L, 14, 0xcccc)
+	exg1(&L, 7, 0xaa00aa)
+	exg1(&L, 4, 0x0f0f0f0f)
+	exg1(&L, 2, 0x33333333)
+	exg1(&L, 1, 0x55555555)
+	exg1(&R, 18, 0x3333)
+	exg1(&R, 9, 0x550055)
+	exg1(&R, 4, 0x0f0f0f0f)
+	R = (R << 4) | (L & 0xf)
+	L >>= 4
+
+	// PC-2 and generate 16 subkeys (each is 2 uint32s = 32 total)
+	// C iterates i=15..0 and stores sequentially (*keys++ = A; *keys++ = B)
+	// We iterate 0..15 to match C's sequential key order
+	keyIdx := 0
+	for i := 0; i < 16; i++ {
+		if rot[i] == 0 {
+			L = (L<<1 | L>>27) & 0x0fffffff
+			R = (R<<1 | R>>27) & 0x0fffffff
+		} else {
+			L = (L<<2 | L>>26) & 0x0fffffff
+			R = (R<<2 | R>>26) & 0x0fffffff
 		}
-		// Set odd parity
-		packed[i] = setOddParity(packed[i])
-	}
 
-	return packed
+		A = pc2[0][L>>24] |
+			pc2[1][(L>>20)&0xf] |
+			pc2[2][(L>>16)&0xf] |
+			pc2[3][(L>>12)&0xf] |
+			pc2[4][(L>>8)&0xf] |
+			pc2[5][(L>>4)&0xf] |
+			pc2[6][L&0xf]
+		B = pc2[7][R>>24] |
+			pc2[8][(R>>20)&0xf] |
+			pc2[9][(R>>16)&0xf] |
+			pc2[10][(R>>12)&0xf] |
+			pc2[11][(R>>8)&0xf] |
+			pc2[12][(R>>4)&0xf] |
+			pc2[13][R&0xf]
+
+		exg2(&B, &A, 16, 0x3f3f)
+		keys[keyIdx] = A
+		keys[keyIdx+1] = B
+		keyIdx += 2
+	}
 }
 
-// setOddParity sets the LSB to make total 1-bits odd
-func setOddParity(b byte) byte {
-	count := byte(0)
-	for i := 0; i < 7; i++ {
-		if b&(1<<i) != 0 {
-			count++
-		}
-	}
-	if count%2 == 0 {
-		b |= 1
-	} else {
-		b &^= 1
-	}
-	return b
+// exg1: exchange bits within a single value
+func exg1(a *uint32, n uint32, m uint32) {
+	t := ((*a >> n) ^ *a) & m
+	*a ^= t
+	*a ^= t << n
 }
 
-// saltToBits converts a 2-character salt to a 24-bit modification pattern
-func saltToBits(salt string) uint64 {
-	var val uint64
-	for i := 0; i < 2; i++ {
-		idx := indexOfIto64(salt[i])
-		val |= uint64(idx) << (i * 6)
-	}
-
-	// Expand 12 bits to 24-bit pattern at positions 16-39
-	var result uint64
-	for i := 0; i < 12; i++ {
-		if (val>>i)&1 != 0 {
-			result |= 1 << (16 + i)
-			result |= 1 << (16 + i + 12)
-		}
-	}
-	return result
+// exg2: exchange bits between two values
+func exg2(a, b *uint32, n uint32, m uint32) {
+	t := (((*a) >> n) ^ *b) & m
+	*b ^= t
+	*a ^= t << n
 }
 
-// toIto64 converts 8 bytes to 11 characters using crypt(3) base64
-func toIto64(data []byte) string {
-	// Reorder: 0,2,4,6,1,3,5,7
-	r := []byte{
-		data[0], data[2], data[4], data[6],
-		data[1], data[3], data[5], data[7],
-	}
-
-	result := make([]byte, 11)
-
-	// Pack 8 bytes into 11 6-bit values
-	v := int(r[0]) >> 2
-	result[0] = ito64[v&0x3f]
-
-	v = ((int(r[0]) & 0x03) << 4) | (int(r[1]) >> 4)
-	result[1] = ito64[v&0x3f]
-
-	v = ((int(r[1]) & 0x0f) << 2) | (int(r[2]) >> 6)
-	result[2] = ito64[v&0x3f]
-
-	v = int(r[2]) & 0x3f
-	result[3] = ito64[v&0x3f]
-
-	v = int(r[3]) >> 2
-	result[4] = ito64[v&0x3f]
-
-	v = ((int(r[3]) & 0x03) << 4) | (int(r[4]) >> 4)
-	result[5] = ito64[v&0x3f]
-
-	v = ((int(r[4]) & 0x0f) << 2) | (int(r[5]) >> 6)
-	result[6] = ito64[v&0x3f]
-
-	v = int(r[5]) & 0x3f
-	result[7] = ito64[v&0x3f]
-
-	v = int(r[6]) >> 2
-	result[8] = ito64[v&0x3f]
-
-	v = ((int(r[6]) & 0x03) << 4) | (int(r[7]) >> 4)
-	result[9] = ito64[v&0x3f]
-
-	v = (int(r[7]) & 0x0f) << 2
-	result[10] = ito64[v&0x3f]
-
-	return string(result)
-}
-
-// isValidIto64 checks if a byte is a valid crypt(3) base64 character
 func isValidIto64(b byte) bool {
 	return indexOfIto64(b) >= 0
 }
 
-// indexOfIto64 returns the index of a character in ito64, or -1 if invalid
 func indexOfIto64(b byte) int {
 	for i := 0; i < len(ito64); i++ {
 		if byte(ito64[i]) == b {
@@ -211,7 +513,6 @@ func indexOfIto64(b byte) int {
 	return -1
 }
 
-// GenerateSalt generates a random 2-character salt
 func GenerateSalt() (string, error) {
 	b := make([]byte, SaltLen)
 	if _, err := rand.Read(b); err != nil {
@@ -221,28 +522,4 @@ func GenerateSalt() (string, error) {
 		b[i] = ito64[int(b[i])%len(ito64)]
 	}
 	return string(b), nil
-}
-
-// newDESCipher creates a DES cipher with salt-modified key schedule
-func newDESCipher(key []byte, saltBits uint64) cipher.Block {
-	// For a proper implementation, we need to modify the DES key schedule
-	// to incorporate the salt bits. This requires implementing DES from scratch.
-	//
-	// For compatibility with traditional crypt, we use a simpler approach:
-	// XOR the key with salt bits before creating the cipher.
-	//
-	// Note: A full implementation would modify the E-box expansion in each round.
-
-	saltedKey := make([]byte, len(key))
-	for i := range key {
-		saltedKey[i] = key[i] ^ byte((saltBits>>(i*8))&0xff)
-	}
-
-	// Set odd parity on salted key
-	for i := range saltedKey {
-		saltedKey[i] = setOddParity(saltedKey[i])
-	}
-
-	c, _ := des.NewCipher(saltedKey)
-	return c
 }
